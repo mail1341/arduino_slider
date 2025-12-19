@@ -5,34 +5,39 @@ import time
 import threading
 from collections import deque
 
-import serial  # pip install pyserial が必要
+import serial  # pip install pyserial
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32, Float32
 
 # --- 送信方式を選ぶ ---
-# 2バイト生データ (little endian) なら True
-# Serial.println(1234) みたいなテキスト送信なら False
 DEFAULT_USE_BINARY = False
 
-# ASCII のときのボーレート
+# ボーレート
 BAUD_ASCII = 115200
-
-# Binary のときのボーレート（mira3.py では 250000）
 BAUD_BINARY = 250000
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
 
 
 class SerialReaderBin:
     """
     Arduino 側が 0〜65535 を 2バイト little-endian で垂れ流す想定の高速リーダー。
     """
-    def __init__(self, port: str, baud: int = BAUD_BINARY):
+    def __init__(self, port: str, baud: int = BAUD_BINARY, sleep_sec: float = 0.001):
         self.port = port
         self.baud = baud
+        self.sleep_sec = float(sleep_sec)
+
         self.ser = None
         self.latest = None  # 最新値だけ保持
         self._stop = False
         self._th = None
+
+        # バッファ暴走対策（同期ズレで溜まり続けるのを防ぐ）
+        self._max_buf = 8192
 
     def start(self):
         try:
@@ -54,14 +59,20 @@ class SerialReaderBin:
                 chunk = self.ser.read(1024)
                 if chunk:
                     buf.extend(chunk)
+
+                    # バッファが増えすぎたら古い分を捨てる（同期ズレ対策）
+                    if len(buf) > self._max_buf:
+                        del buf[:-256]  # 最後の少しだけ残す
+
                     # 2バイトずつ読む
                     while len(buf) >= 2:
                         v = buf[0] | (buf[1] << 8)  # little-endian
                         del buf[:2]
-                        self.latest = v
+                        self.latest = int(v)
             except Exception:
                 pass
-            time.sleep(0.001)  # CPU 負荷軽減
+
+            time.sleep(self.sleep_sec)
 
     def get(self):
         """最新値（int or None）を返す"""
@@ -88,45 +99,66 @@ class SliderNode(Node):
     def __init__(self):
         super().__init__("slider_node")
 
-        # パラメータ
+        # ===== パラメータ =====
         self.declare_parameter("port", "/dev/ttyACM0")
         self.declare_parameter("use_binary", DEFAULT_USE_BINARY)
+
         self.declare_parameter("publish_rate_hz", 50.0)
         self.declare_parameter("smoothing_alpha", 0.5)
         self.declare_parameter("max_value", 1023.0)
 
-        self.port = self.get_parameter("port").get_parameter_value().string_value
-        self.use_binary = self.get_parameter("use_binary").get_parameter_value().bool_value
-        self.publish_rate_hz = self.get_parameter("publish_rate_hz").get_parameter_value().double_value
-        self.alpha = self.get_parameter("smoothing_alpha").get_parameter_value().double_value
-        self.max_value = self.get_parameter("max_value").get_parameter_value().double_value
+        # topic（絶対名にして他ノードとズレにくく）
+        self.declare_parameter("topic_raw", "/slider_raw")
+        self.declare_parameter("topic_smooth", "/slider_smooth")
 
-        # パブリッシャ
-        self.pub_raw = self.create_publisher(Int32, "slider_raw", 10)
-        self.pub_smooth = self.create_publisher(Float32, "slider_smooth", 10)
+        # ASCII モードで1周期に読む最大行数（負荷抑制）
+        self.declare_parameter("ascii_max_lines_per_tick", 20)
 
-        # 内部状態
+        self.port = self.get_parameter("port").value
+        self.use_binary = self.get_parameter("use_binary").value
+        self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+
+        self.alpha = float(self.get_parameter("smoothing_alpha").value)
+        self.max_value = float(self.get_parameter("max_value").value)
+
+        self.topic_raw = self.get_parameter("topic_raw").value
+        self.topic_smooth = self.get_parameter("topic_smooth").value
+        self.ascii_max_lines = int(self.get_parameter("ascii_max_lines_per_tick").value)
+
+        # alpha の安全化（0〜1）
+        self.alpha = _clamp(self.alpha, 0.0, 1.0)
+
+        # ===== publisher =====
+        self.pub_raw = self.create_publisher(Int32, self.topic_raw, 10)
+        self.pub_smooth = self.create_publisher(Float32, self.topic_smooth, 10)
+
+        # ===== 内部状態 =====
         self.latest_raw = None
         self.smooth_val = None
 
-        # シリアル初期化
+        # ===== シリアル初期化 =====
+        self.reader_bin = None
+        self.ser_ascii = None
+
         if self.use_binary:
             self.get_logger().info(
                 f"Using BINARY mode on {self.port} @ {BAUD_BINARY} (2-byte little-endian)"
             )
             self.reader_bin = SerialReaderBin(self.port, BAUD_BINARY)
             self.reader_bin.start()
-            self.ser_ascii = None
         else:
             self.get_logger().info(
                 f"Using ASCII mode on {self.port} @ {BAUD_ASCII} (Serial.println)"
             )
-            self.reader_bin = None
             self.ser_ascii = self._open_ascii()
 
-        # タイマーで定期実行
+        # ===== timer =====
         dt = 1.0 / self.publish_rate_hz if self.publish_rate_hz > 0.0 else 0.02
         self.timer = self.create_timer(dt, self.timer_callback)
+
+        self.get_logger().info(
+            f"Publish: raw={self.topic_raw}, smooth={self.topic_smooth}, rate={1.0/dt:.1f}Hz, alpha={self.alpha:.2f}"
+        )
 
     # --- ASCII モード用 ---
     def _open_ascii(self):
@@ -140,62 +172,60 @@ class SliderNode(Node):
             return None
 
     def _read_ascii_once(self):
-
+        """
+        1タイマー周期で最大 ascii_max_lines 行だけ読む。
+        読めた中で一番新しい int を返す（無ければ None）
+        """
         if self.ser_ascii is None:
             return None
 
         latest = None
         try:
-            while True:
+            for _ in range(max(self.ascii_max_lines, 1)):
                 line = self.ser_ascii.readline().decode("utf-8", errors="ignore").strip()
                 if not line:
-                    break  # これ以上読むものがなければ終了
+                    break
                 try:
-                    v = int(line)
-                    latest = v  # 成功したものを「最新」として記録
+                    latest = int(line)
                 except ValueError:
-                    # 数字でない行は無視して次へ
                     continue
         except Exception as e:
-            self.get_logger().warn(f"[ArduinoAscii] read error: {e}")
+            # 連続ログを避けたいなら throttle を入れてもよい
+            self.get_logger().warning(f"[ArduinoAscii] read error: {e}")
             return None
 
-        return latest  # 読めた中で一番新しい値（無ければ None）
+        return latest
 
-
-    # --- タイマーコールバック: 定期的に値を読んで publish ---
-    def timer_callback(self):
-        # 1) 値を取得
+    def _get_value(self):
         if self.use_binary:
-            v = self.reader_bin.get() if self.reader_bin is not None else None
-        else:
-            v = self._read_ascii_once()
+            return self.reader_bin.get() if self.reader_bin is not None else None
+        return self._read_ascii_once()
 
+    def timer_callback(self):
+        v = self._get_value()
         if v is None:
-            # 読めなかった瞬間は publish をスキップ
             return
 
-        self.latest_raw = int(v)
+        # 0〜max_value でクリップ（ノイズ/異常値対策）
+        raw = int(_clamp(float(v), 0.0, self.max_value))
+        self.latest_raw = raw
 
-        # 2) 簡単な平滑化（IIR: smooth = alpha * new + (1-alpha) * old）
+        # IIR 平滑化
         if self.smooth_val is None:
-            self.smooth_val = float(self.latest_raw)
+            self.smooth_val = float(raw)
         else:
-            a = float(self.alpha)
-            self.smooth_val = (1.0 - a) * self.smooth_val + a * float(self.latest_raw)
+            a = self.alpha
+            self.smooth_val = (1.0 - a) * self.smooth_val + a * float(raw)
 
-        # 3) publish (raw)
+        # publish raw
         msg_raw = Int32()
-        msg_raw.data = self.latest_raw
+        msg_raw.data = raw
         self.pub_raw.publish(msg_raw)
 
-        # 4) publish (smooth)
+        # publish smooth
         msg_smooth = Float32()
         msg_smooth.data = float(self.smooth_val)
         self.pub_smooth.publish(msg_smooth)
-
-        # デバッグ用（うるさければコメントアウト）
-        #self.get_logger().info(f"raw={self.latest_raw}, smooth={self.smooth_val:.1f}")
 
     def destroy_node(self):
         self.get_logger().info("Shutting down slider_node...")
@@ -204,11 +234,13 @@ class SliderNode(Node):
                 self.reader_bin.stop()
         except Exception:
             pass
-        if hasattr(self, "ser_ascii") and self.ser_ascii is not None:
+
+        if self.ser_ascii is not None:
             try:
                 self.ser_ascii.close()
             except Exception:
                 pass
+
         super().destroy_node()
 
 
